@@ -1,0 +1,4 @@
+# Personal runtime state - created automatically on first run.
+# Never commit: it holds each user's own colors, schedule, and the
+# autostart flag (shipping one would enable autostart for new users).
+settings.json
