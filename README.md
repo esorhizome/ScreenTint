@@ -4,6 +4,11 @@ A personal full-screen color filter for Windows — deep tints, dimming, and rea
 blue-light reduction, in one readable file you own forever. No installer, no
 accounts, no network access at all.
 
+<img src="settings-panel.png" alt="The ScreenTint settings panel" width="560">
+
+*The settings panel. It follows your Windows theme — shown here in high
+contrast — and scales itself to your DPI and text size.*
+
 ## Why this exists
 
 Screen color filters sit in an awkward spot: the best-known ones are
