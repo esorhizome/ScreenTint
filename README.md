@@ -6,8 +6,9 @@ accounts, no network access at all.
 
 <img src="settings-panel.png" alt="The ScreenTint settings panel" width="560">
 
-*The settings panel. It follows your Windows theme — shown here in high
-contrast — and scales itself to your DPI and text size.*
+*The settings panel, shown here in high contrast. It can match Windows'
+light/dark mode, stay dark or light, or switch by time of day — and scales
+itself to your DPI and text size.*
 
 ## Why this exists
 
@@ -93,15 +94,39 @@ theme (including high contrast) — nothing should clip. To make the whole panel
 bigger or smaller, set `panelFontSize` in settings.json (7–24, default 10.5) and
 use tray → Reload.
 
+## Panel theme
+
+The *Panel theme* menu in the settings panel:
+
+| Choice           | What the panel does                                        |
+| ---------------- | ---------------------------------------------------------- |
+| Match Windows    | follows Windows' light/dark app mode (the default)         |
+| Always dark      | dark, whatever Windows is set to                           |
+| Always light     | light, whatever Windows is set to                          |
+| By time of day   | light during the *day from … to …* hours, dark otherwise   |
+
+"By time of day" uses the same day hours as *Auto day/night* (whether or not
+that box is ticked). Changes show live while the panel is open. With a Windows
+high-contrast theme on, the panel always uses your high-contrast colors.
+
 ## Sharing the screen with other always-on-top apps
 
 Windows keeps one pile of "always on top" windows, and whoever asserts last sits
-highest — so tools like PowerToys can momentarily shove the veil down. v2
-re-asserts its place every 1.5 seconds, so the veil comes right back, and
-it deliberately keeps its own settings panel *above* the veil so the panel stays
-readable. The blue-light cut is immune to all of this (it's not a window), and
-it's also re-applied every 15 seconds in case Night Light or a game rewrites the
-gamma table.
+highest — so other apps can shove the veil down, and around full-screen or
+virtual-desktop changes Windows may stop drawing it ("cloaking"). A small guard
+checks twice a second:
+
+1. another app's window on top of the veil → the veil re-claims the top (and
+   keeps its own settings panel above it, so the panel stays readable);
+2. veil hidden or cloaked → it's re-shown — the automatic version of toggling
+   *Filter on*;
+3. still hidden after three tries → the veil is rebuilt as brand-new windows,
+   which Windows always draws on the desktop you're looking at;
+4. after sleep or lock → the veil is refreshed once.
+
+Tray → **Bring the tint back** does step 2 on demand. The blue-light cut is
+immune to all of this (it's not a window), and it's re-applied every 15 seconds
+in case Night Light or a game rewrites the gamma table.
 
 ## For the skeptics: verify it yourself
 

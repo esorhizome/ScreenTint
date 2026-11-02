@@ -1,5 +1,5 @@
 # =====================================================================
-#  ScreenTint.ps1  (v2)  -  a personal full-screen color filter for Windows
+#  ScreenTint.ps1  (v2.1) -  a personal full-screen color filter for Windows
 #  (c) 2026 esorhizome OU - CC BY 4.0 (creativecommons.org/licenses/by/4.0)
 # =====================================================================
 #  What this program does, in full:
@@ -13,6 +13,12 @@
 #       a custom color, a tint slider, a blue-light slider, on/off,
 #       a day/night schedule, and a start-with-Windows box.
 #    4. Remembers your choices in "settings.json" next to this file.
+#    5. Keeps the veil visible: about twice a second a small "guard"
+#       checks that no other app's window has slid on top of it and
+#       that Windows hasn't hidden ("cloaked") it - and quietly fixes
+#       either. (This replaces turning "Filter on" off and on.)
+#    6. The settings panel can be dark: match Windows, always dark,
+#       always light, or light during the day hours / dark at night.
 #
 #  What it deliberately does NOT do:
 #    - It never reads your screen. It only draws over it and adjusts
@@ -55,6 +61,12 @@ $Presets = @(
 )
 $MaxIntensity = 85       # tint cap, so the screen can never go fully dark
 $RecommendedText = 'rec. 30-50'
+$ThemeChoices = @(
+    @{ key = 'system'; label = 'Match Windows' },
+    @{ key = 'dark';   label = 'Always dark' },
+    @{ key = 'light';  label = 'Always light' },
+    @{ key = 'time';   label = 'By time of day' }
+)
 
 # Blue-light curve: at slider 100%, blue output is multiplied by
 # BlueFloor and green by GreenFloor. 0.50 is the deepest value Windows
@@ -74,6 +86,13 @@ $script:EditProfile  = 'day'
 $script:LastActive   = ''
 $script:LastLayout   = ''
 $script:TickN        = 0
+$script:PanelDark    = $null         # theme currently painted on the panel
+$script:GuardFails   = 0             # consecutive checks that found the veil hidden
+$script:LastGuard    = [DateTime]::UtcNow
+$script:LastRebuild  = [DateTime]::MinValue
+# ScreenTint yields the top spot to nobody (ReadingGuide yields to it),
+# so the two apps settle into one steady order instead of leapfrogging.
+$script:Friends      = [string[]]@()
 
 # Default settings (used where settings.json is missing or invalid)
 $script:S = @{
@@ -84,6 +103,7 @@ $script:S = @{
     schedule      = @{ enabled = $false; dayFrom = 8; dayTo = 18 }
     autostart     = $false
     panelFontSize = 10.5
+    panelTheme    = 'system'       # 'system' | 'dark' | 'light' | 'time' (time = day hours below)
     hotkeys       = @{ toggle = 'Ctrl+Shift+F9'; up = 'Ctrl+Shift+F12'; down = 'Ctrl+Shift+F11' }
 }
 
@@ -108,10 +128,56 @@ namespace ScreenTint {
     [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
     [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
     [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr hIcon);
+    [DllImport("user32.dll")] public static extern bool SetLayeredWindowAttributes(IntPtr hWnd, uint crKey, byte bAlpha, uint dwFlags);
+    [DllImport("dwmapi.dll")] public static extern int  DwmSetWindowAttribute(IntPtr hWnd, int attr, ref int value, int size);
     [DllImport("gdi32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr CreateDC(string driver, string device, string port, IntPtr initData);
     [DllImport("gdi32.dll")] public static extern bool DeleteDC(IntPtr hDC);
     [DllImport("gdi32.dll")] public static extern bool GetDeviceGammaRamp(IntPtr hDC, ushort[] ramp);
     [DllImport("gdi32.dll")] public static extern bool SetDeviceGammaRamp(IntPtr hDC, ushort[] ramp);
+  }
+  // The guard: answers "can the user actually see this veil right now?"
+  // Read-only questions about window order - it never reads pixels.
+  public static class Guard {
+    [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+    [DllImport("user32.dll")] static extern IntPtr GetTopWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hWnd, out RECT r);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder s, int max);
+    [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+    [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr hWnd, int attr, out int value, int size);
+
+    // "Cloaked" = Windows keeps the window but stops drawing it (other
+    // virtual desktop, some full-screen app transitions, etc.).
+    public static bool IsCloaked(IntPtr h) {
+      try { int v; return DwmGetWindowAttribute(h, 14, out v, 4) == 0 && v != 0; } catch { return false; }
+    }
+    // 0 = fine
+    // 1 = another app's window sits on top of it (or it lost always-on-top) -> raise it
+    // 2 = hidden or cloaked -> re-show it
+    public static int Check(IntPtr me, string[] friends) {
+      if (!IsWindowVisible(me) || IsCloaked(me)) return 2;
+      if ((GetWindowLong(me, -20) & 0x8) == 0) return 1;      // WS_EX_TOPMOST lost
+      RECT m; if (!GetWindowRect(me, out m)) return 0;
+      uint myPid; GetWindowThreadProcessId(me, out myPid);
+      var sb = new System.Text.StringBuilder(64);
+      // Walk down from the very top of the window pile until we reach ourselves.
+      IntPtr w = GetTopWindow(IntPtr.Zero);
+      for (int n = 0; w != IntPtr.Zero && w != me && n < 5000; n++, w = GetWindow(w, 2)) {
+        if (!IsWindowVisible(w) || IsCloaked(w)) continue;
+        RECT r; if (!GetWindowRect(w, out r)) continue;
+        if (r.Right <= m.Left || r.Left >= m.Right || r.Bottom <= m.Top || r.Top >= m.Bottom) continue;
+        uint pid; GetWindowThreadProcessId(w, out pid);
+        if (pid == myPid) continue;                            // our own panel / dialogs
+        if (friends != null && friends.Length > 0) {
+          sb.Length = 0; GetWindowText(w, sb, 64);
+          if (Array.IndexOf(friends, sb.ToString()) >= 0) continue;
+        }
+        return 1;
+      }
+      return 0;
+    }
   }
   // Invisible message window that receives the registered hotkeys.
   public class HotkeyWindow : System.Windows.Forms.NativeWindow, IDisposable {
@@ -162,6 +228,7 @@ function Load-Settings {
         }
         if ($j.autostart -is [bool]) { $script:S.autostart = $j.autostart }
         try { $f = [double]$j.panelFontSize; if ($f -ge 7 -and $f -le 24) { $script:S.panelFontSize = $f } } catch {}
+        if ($j.panelTheme -in @('system','dark','light','time')) { $script:S.panelTheme = "$($j.panelTheme)" }
         if ($j.hotkeys) {
             foreach ($hk in @('toggle','up','down')) {
                 $v = $j.hotkeys.$hk
@@ -177,14 +244,20 @@ function Save-Settings {
     } catch { }  # a failed save must never break the filter itself
 }
 
+function In-HourSpan([int]$h, [int]$from, [int]$to) {
+    # True when hour $h is inside [from, to). Handles spans that cross
+    # midnight, e.g. 20 -> 6.
+    if ($from -le $to) { ($h -ge $from) -and ($h -lt $to) }
+    else               { ($h -ge $from) -or  ($h -lt $to) }
+}
+
+function Is-DayHours {
+    In-HourSpan (Get-Date).Hour ([int]$script:S.schedule.dayFrom) ([int]$script:S.schedule.dayTo)
+}
+
 function Get-ActiveProfileName {
     if ($script:S.schedule.enabled) {
-        $h    = (Get-Date).Hour
-        $from = [int]$script:S.schedule.dayFrom
-        $to   = [int]$script:S.schedule.dayTo
-        $isDay = if ($from -le $to) { ($h -ge $from) -and ($h -lt $to) }
-                 else               { ($h -ge $from) -or  ($h -lt $to) }   # overnight span
-        if ($isDay) { 'day' } else { 'night' }
+        if (Is-DayHours) { 'day' } else { 'night' }
     } else { $script:S.manualProfile }
 }
 
@@ -368,6 +441,73 @@ function Apply-Tint {
     Sync-Ui
 }
 
+# --- Keeping the veil visible ----------------------------------------
+# Windows sometimes lets another app's always-on-top window slide over
+# the veil, or "cloaks" (stops drawing) it - e.g. around full-screen or
+# virtual-desktop changes. The guard spots both and repairs them, so
+# you never have to flick "Filter on" off and on.
+function Raise-Form($f) {
+    # HWND_TOPMOST = -1; NOMOVE|NOSIZE|NOACTIVATE = 0x13
+    $null = [ScreenTint.Native]::SetWindowPos($f.Handle, [IntPtr](-1), 0, 0, 0, 0, 0x13)
+}
+
+function Raise-Veil {
+    foreach ($o in $script:Overlays) {
+        if ($o -and -not $o.IsDisposed -and $o.Visible) { Raise-Form $o }
+    }
+    # Keep the settings panel readable above its own veil.
+    if ($script:SF -and $script:SF.Visible) { Raise-Form $script:SF }
+}
+
+function Reshow-Form($f) {
+    # Exactly what toggling "Filter on" did by hand: hide, show again,
+    # re-apply the see-through level, go on top.
+    $f.Visible = $false
+    $f.Visible = $true
+    $a = [byte][Math]::Max(0, [Math]::Min(255, [int]($f.Opacity * 255)))
+    $null = [ScreenTint.Native]::SetLayeredWindowAttributes($f.Handle, 0, $a, 2)   # LWA_ALPHA
+}
+
+function Reshow-Veil {
+    # Tray menu "Bring the tint back" - the manual version of the guard.
+    foreach ($o in $script:Overlays) {
+        if ($o -and -not $o.IsDisposed -and $o.Visible) { Reshow-Form $o }
+    }
+    Raise-Veil
+}
+
+function Guard-Veil {
+    $now = [DateTime]::UtcNow
+    # A long gap between checks means the PC slept or was locked;
+    # windows can come back from that undrawn, so refresh them once.
+    $woke = ($now - $script:LastGuard).TotalSeconds -gt 5
+    $script:LastGuard = $now
+    if (-not $script:S.enabled -or $script:DialogOpen) { $script:GuardFails = 0; return }
+    $broken = @(); $covered = $false
+    foreach ($o in $script:Overlays) {
+        if (-not $o -or $o.IsDisposed -or -not $o.Visible) { continue }
+        $code = [ScreenTint.Guard]::Check($o.Handle, $script:Friends)
+        if ($woke -or $code -eq 2) { $broken += $o }
+        elseif ($code -eq 1)       { $covered = $true }
+    }
+    if ($broken.Count -gt 0) {
+        $script:GuardFails++
+        if ($script:GuardFails -ge 3 -and ($now - $script:LastRebuild).TotalSeconds -gt 10) {
+            # Re-showing didn't stick three times running -> fresh windows,
+            # which Windows always draws on the desktop you're looking at.
+            $script:GuardFails = 0
+            $script:LastRebuild = $now
+            Rebuild-Overlays
+        } else {
+            foreach ($o in $broken) { Reshow-Form $o }
+            Raise-Veil
+        }
+        return
+    }
+    $script:GuardFails = 0
+    if ($covered) { Raise-Veil }
+}
+
 # --- Tray icon -------------------------------------------------------
 function Update-TrayIcon {
     if (-not $script:Tray) { return }
@@ -453,6 +593,98 @@ function New-AutoLabel([string]$text) {
     $l
 }
 
+# --- Panel theme (light / dark) -------------------------------------
+function Get-WantDark {
+    # High contrast always wins: leave the panel in your chosen system
+    # colors so nothing you rely on is overridden.
+    if ([System.Windows.Forms.SystemInformation]::HighContrast) { return $false }
+    switch ($script:S.panelTheme) {
+        'dark'  { return $true }
+        'light' { return $false }
+        'time'  { return (-not (Is-DayHours)) }   # same day hours as the tint
+        default {
+            # Windows' own "app mode" switch (Settings > Personalization >
+            # Colors). Reading it changes nothing.
+            try {
+                $v = [Microsoft.Win32.Registry]::GetValue(
+                    'HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize',
+                    'AppsUseLightTheme', $null)
+                return ($null -ne $v -and [int]$v -eq 0)
+            } catch { return $false }
+        }
+    }
+}
+
+function Set-ControlTheme($c, [bool]$dark, $P) {
+    if ($c.Name -eq 'swatch') { return }   # color swatches keep their color
+    if ($c -is [System.Windows.Forms.Button]) {
+        if ($dark) {
+            $c.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+            $c.FlatAppearance.BorderColor = $P.border
+            $c.BackColor = $P.button
+        } else {
+            $c.FlatStyle = [System.Windows.Forms.FlatStyle]::Standard
+            $c.BackColor = [System.Drawing.SystemColors]::Control
+            $c.UseVisualStyleBackColor = $true
+        }
+        $c.ForeColor = $P.fore
+    } elseif ($c -is [System.Windows.Forms.ComboBox]) {
+        $c.FlatStyle = if ($dark) { [System.Windows.Forms.FlatStyle]::Flat } else { [System.Windows.Forms.FlatStyle]::Standard }
+        $c.BackColor = $P.input; $c.ForeColor = $P.fore
+    } elseif ($c -is [System.Windows.Forms.NumericUpDown]) {
+        $c.BorderStyle = if ($dark) { [System.Windows.Forms.BorderStyle]::FixedSingle } else { [System.Windows.Forms.BorderStyle]::Fixed3D }
+        $c.BackColor = $P.input; $c.ForeColor = $P.fore
+    } elseif ($c -is [System.Windows.Forms.TrackBar]) {
+        $c.BackColor = $P.back
+    } elseif ($c -is [System.Windows.Forms.Label]) {
+        $c.ForeColor = if ($c.Name -eq 'dim') { $P.dim } else { $P.fore }
+    } else {
+        # panels, check boxes, radio buttons
+        $c.BackColor = $P.back; $c.ForeColor = $P.fore
+    }
+    foreach ($k in $c.Controls) { Set-ControlTheme $k $dark $P }
+}
+
+function Apply-PanelTheme([bool]$dark) {
+    if (-not $script:SF -or $script:SF.IsDisposed) { return }
+    if ($dark) {
+        # Same family of greys Windows 11 uses for its own dark windows.
+        $P = @{
+            back = ColorFromHex '#202020'; fore = ColorFromHex '#F0F0F0'; dim = ColorFromHex '#A8A8A8'
+            button = ColorFromHex '#2F2F2F'; border = ColorFromHex '#5C5C5C'; input = ColorFromHex '#2B2B2B'
+        }
+    } else {
+        $sc = [System.Drawing.SystemColors]
+        $P = @{
+            back = $sc::Control; fore = $sc::ControlText; dim = $sc::GrayText
+            button = $sc::Control; border = $sc::ControlDark; input = $sc::Window
+        }
+    }
+    $script:SF.SuspendLayout()
+    try {
+        $script:SF.BackColor = $P.back
+        $script:SF.ForeColor = $P.fore
+        foreach ($c in $script:SF.Controls) { Set-ControlTheme $c $dark $P }
+    } finally { $script:SF.ResumeLayout() }
+    # Dark title bar (Windows 10 20H1+ / 11): attribute 20, or 19 on
+    # older builds. FRAMECHANGED makes Windows repaint it right away.
+    $v = [int]$dark
+    try {
+        if ([ScreenTint.Native]::DwmSetWindowAttribute($script:SF.Handle, 20, [ref]$v, 4) -ne 0) {
+            $null = [ScreenTint.Native]::DwmSetWindowAttribute($script:SF.Handle, 19, [ref]$v, 4)
+        }
+        $null = [ScreenTint.Native]::SetWindowPos($script:SF.Handle, [IntPtr]::Zero, 0, 0, 0, 0, 0x37)
+    } catch {}
+    $script:SF.Invalidate($true)
+    $script:PanelDark = $dark
+}
+
+function Update-PanelTheme {
+    # Cheap: repaints only when the wanted theme actually changed.
+    $want = Get-WantDark
+    if ($want -ne $script:PanelDark) { Apply-PanelTheme $want }
+}
+
 function Build-SettingsForm {
     $fs = [double]$script:S.panelFontSize
     $SF = New-Object System.Windows.Forms.Form
@@ -485,7 +717,7 @@ function Build-SettingsForm {
     $script:RadNight.Text = 'Night'; $script:RadNight.AutoSize = $true
     $row.Controls.Add($script:RadNight)
     $script:LblActive = New-AutoLabel ''
-    $script:LblActive.ForeColor = [System.Drawing.SystemColors]::GrayText
+    $script:LblActive.Name = 'dim'
     $row.Controls.Add($script:LblActive)
     $stack.Controls.Add($row)
 
@@ -510,6 +742,7 @@ function Build-SettingsForm {
         $b.BackColor = ColorFromHex $pr.hex
         $tips.SetToolTip($b, $pr.name)
         $b.Tag = $pr.hex
+        $b.Name = 'swatch'
         $b.add_Click({ param($s, $e) Set-ProfileColor $script:EditProfile ([string]$s.Tag) })
         $row.Controls.Add($b)
     }
@@ -537,7 +770,7 @@ function Build-SettingsForm {
     $row = New-Row
     $row.Controls.Add((New-AutoLabel 'Tint strength'))
     $script:LblTintPct = New-AutoLabel ''
-    $script:LblTintPct.ForeColor = [System.Drawing.SystemColors]::GrayText
+    $script:LblTintPct.Name = 'dim'
     $row.Controls.Add($script:LblTintPct)
     $stack.Controls.Add($row)
 
@@ -557,7 +790,7 @@ function Build-SettingsForm {
     $row = New-Row
     $row.Controls.Add((New-AutoLabel 'Blue-light cut'))
     $script:LblBluePct = New-AutoLabel ''
-    $script:LblBluePct.ForeColor = [System.Drawing.SystemColors]::GrayText
+    $script:LblBluePct.Name = 'dim'
     $row.Controls.Add($script:LblBluePct)
     $stack.Controls.Add($row)
 
@@ -617,6 +850,28 @@ function Build-SettingsForm {
     $row.Controls.Add($script:NumTo)
     $stack.Controls.Add($row)
 
+    # Row: panel theme -------------------------------------------------
+    $row = New-Row
+    $row.Controls.Add((New-AutoLabel 'Panel theme:'))
+    $script:CmbTheme = New-Object System.Windows.Forms.ComboBox
+    $script:CmbTheme.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+    $script:CmbTheme.Width = [int]($fs * 13)
+    foreach ($t in $ThemeChoices) { $null = $script:CmbTheme.Items.Add($t.label) }
+    $tips.SetToolTip($script:CmbTheme, 'Match Windows follows your light/dark app mode; By time of day is light during the day hours above')
+    $script:CmbTheme.add_SelectedIndexChanged({
+        if ($script:UiSync -or $script:CmbTheme.SelectedIndex -lt 0) { return }
+        $script:S.panelTheme = $ThemeChoices[$script:CmbTheme.SelectedIndex].key
+        Save-Settings
+        Sync-Ui
+        Update-PanelTheme
+    })
+    $row.Controls.Add($script:CmbTheme)
+    $script:LblThemeHint = New-AutoLabel '(light during day hours)'
+    $script:LblThemeHint.Name = 'dim'
+    $script:LblThemeHint.Visible = ($script:S.panelTheme -eq 'time')
+    $row.Controls.Add($script:LblThemeHint)
+    $stack.Controls.Add($row)
+
     # Row: autostart ---------------------------------------------------
     $script:ChkAuto = New-Object System.Windows.Forms.CheckBox
     $script:ChkAuto.Text = 'Start with Windows'; $script:ChkAuto.AutoSize = $true
@@ -628,11 +883,11 @@ function Build-SettingsForm {
 
     # Rows: hints ------------------------------------------------------
     $script:LblKeys = New-AutoLabel ''
-    $script:LblKeys.ForeColor = [System.Drawing.SystemColors]::GrayText
+    $script:LblKeys.Name = 'dim'
     $stack.Controls.Add($script:LblKeys)
 
     $lblNote = New-AutoLabel 'Panel size, hotkeys: edit settings.json, then tray > Reload.'
-    $lblNote.ForeColor = [System.Drawing.SystemColors]::GrayText
+    $lblNote.Name = 'dim'
     $stack.Controls.Add($lblNote)
 
     # Closing the panel hides it; the app lives in the tray.
@@ -664,6 +919,10 @@ function Sync-Ui {
         $script:NumFrom.Value    = [int]$script:S.schedule.dayFrom
         $script:NumTo.Value      = [int]$script:S.schedule.dayTo
         $script:ChkAuto.Checked  = [bool]$script:S.autostart
+        $ti = 0
+        for ($i = 0; $i -lt $ThemeChoices.Count; $i++) { if ($ThemeChoices[$i].key -eq $script:S.panelTheme) { $ti = $i } }
+        $script:CmbTheme.SelectedIndex = $ti
+        $script:LblThemeHint.Visible = ($script:S.panelTheme -eq 'time')
         $script:LblKeys.Text     = ('Hotkeys:  {0} = on/off      {1} / {2} = tint' -f `
             $script:S.hotkeys.toggle, $script:S.hotkeys.up, $script:S.hotkeys.down)
     } finally {
@@ -673,6 +932,7 @@ function Sync-Ui {
 
 function Show-Settings {
     $script:EditProfile = Get-ActiveProfileName
+    Update-PanelTheme           # paint the right theme before it appears
     $script:SF.Show()
     Sync-Ui
     $script:SF.Activate()
@@ -684,6 +944,7 @@ function Reload-Everything {
     $wasVisible = $script:SF -and $script:SF.Visible
     try { $script:SF.Dispose() } catch {}
     $script:SF = Build-SettingsForm
+    $script:PanelDark = $null   # new panel: theme not painted yet
     Apply-Tint
     if ($wasVisible) { Show-Settings }
 }
@@ -721,6 +982,8 @@ try {
     $miOpen.add_Click({ Show-Settings })
     $script:MenuToggle = $menu.Items.Add('Filter on')
     $script:MenuToggle.add_Click({ Toggle-Filter })
+    $miReshow = $menu.Items.Add('Bring the tint back')
+    $miReshow.add_Click({ Reshow-Veil })
     $miReload = $menu.Items.Add('Reload settings.json')
     $miReload.add_Click({ Reload-Everything })
     $miReset = $menu.Items.Add('Reset display colors')
@@ -753,35 +1016,26 @@ try {
         }
     })
 
-    # Maintenance timer: keep the veil on top (other always-on-top apps,
-    # like PowerToys, jump the queue - we politely jump back), follow
-    # monitor changes, switch day/night on schedule, and periodically
-    # re-assert gamma in case Night Light or a game overwrote it.
+    # Maintenance timer (every 0.5 s): keep the veil visible and on top
+    # (the guard), follow monitor changes, switch day/night on schedule,
+    # follow the panel theme, and every 15 s re-assert gamma in case
+    # Night Light or a game overwrote it.
     $script:Timer = New-Object System.Windows.Forms.Timer
-    $script:Timer.Interval = 1500
+    $script:Timer.Interval = 500
     $script:Timer.add_Tick({
         try {
             $script:TickN++
             if ((Get-LayoutSignature) -ne $script:LastLayout) { Rebuild-Overlays; return }
             if ((Get-ActiveProfileName) -ne $script:LastActive) { Apply-Tint; return }
-            if (-not $script:DialogOpen) {
-                foreach ($o in $script:Overlays) {
-                    if ($o -and -not $o.IsDisposed -and $o.Visible) {
-                        # HWND_TOPMOST = -1; NOMOVE|NOSIZE|NOACTIVATE = 0x13
-                        $null = [ScreenTint.Native]::SetWindowPos($o.Handle, [IntPtr](-1), 0, 0, 0, 0, 0x13)
-                    }
-                }
-                # Keep the settings panel readable above its own veil.
-                if ($script:SF -and $script:SF.Visible) {
-                    $null = [ScreenTint.Native]::SetWindowPos($script:SF.Handle, [IntPtr](-1), 0, 0, 0, 0, 0x13)
-                }
-            }
-            if (($script:TickN % 10) -eq 0 -and $script:S.enabled) {
+            Guard-Veil
+            if (($script:TickN % 4) -eq 0 -and $script:SF -and $script:SF.Visible) { Update-PanelTheme }
+            if (($script:TickN % 30) -eq 0 -and $script:S.enabled) {
                 $p = $script:S[(Get-ActiveProfileName)]
                 if ((Clamp-Blue ([int]$p.blue)) -gt 0) { Apply-Gamma ([int]$p.blue) }
             }
         } catch { }
     })
+    $script:LastGuard = [DateTime]::UtcNow
     $script:Timer.Start()
 
     # Keep the autostart entry in sync (also heals the path after the
