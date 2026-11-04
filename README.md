@@ -163,6 +163,7 @@ show the clean, untinted screen.
   running; borderless-windowed mode behaves. Gamma is re-applied within 15 s.
 - **Night Light**: leave it off — otherwise the two take turns rewriting the
   same gamma table.
+    - note from human: WHILE THE ABOVE IS TECHNICALLY TRUE... if you want a dimmer screen, turning the night light on simultaneously can accomplish that.
 - **HDR mode** can mute both effects — Windows composites HDR differently.
 - Windows caps how far gamma may bend without an unlock: at 100% the blue
   channel bottoms out at ×0.50. If you ever want *deeper*, there's a documented
